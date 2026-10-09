@@ -20,8 +20,8 @@ yolo11_detect
 *.pt
 
 # Program outputs
-annotated.jpg
-detections.csv
+# annotated.jpg
+# detections.csv
 
 # Input images (uncomment the next line if you want to keep ALL images out of the repo)
 # *.jpg

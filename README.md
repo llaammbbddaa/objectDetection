@@ -138,3 +138,9 @@ Everything lives in `main.cpp`:
 ```
 
 The model (`yolo11.onnx`) and generated outputs are not tracked in git; see `.gitignore`.
+
+# example
+
+![original](image.jpg)
+![annotated](annotated.jpg)
+
