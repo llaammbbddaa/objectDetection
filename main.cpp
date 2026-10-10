@@ -1,11 +1,13 @@
-// YOLO11n ONNX inference with OpenCV 4.5.4 (DNN module)
+// YOLO26n ONNX inference with OpenCV 4.11 (DNN module)
 //
-// Model export used:
-//   yolo export model=yolo11n.pt format=onnx opset=12 simplify=True
+// Model export used (end-to-end, NMS-free; this is YOLO26's default):
+//   yolo export model=yolo26n.pt format=onnx opset=12 simplify=True
+// The classic YOLO-style export is also supported (adds NMS on our side):
+//   yolo export model=yolo26n.pt format=onnx opset=12 simplify=True end2end=False
 //
 // Usage:
-//   ./yolo11_detect <input_image> [conf_thresh=0.25] [nms_thresh=0.45]
-//   ./yolo11_detect <input_directory> <csv_directory> <annotated_directory>
+//   ./yolo26_detect <input_image> [conf_thresh=0.25] [nms_thresh=0.45]
+//   ./yolo26_detect <input_directory> <csv_directory> <annotated_directory>
 //                   [conf_thresh=0.25] [nms_thresh=0.45]
 //
 // Outputs:
@@ -136,43 +138,83 @@ static std::vector<Detection> detectTile(const cv::Mat &image, cv::dnn::Net &net
         throw std::runtime_error("Network produced no output.");
 
     const cv::Mat &raw = outputs[0];
-    const int numChannels = raw.size[1];
-    const int numAnchors = raw.size[2];
-    const int numClasses = numChannels - 4;
-    cv::Mat flat(numChannels, numAnchors, CV_32F, const_cast<float *>(raw.ptr<float>()));
-    cv::Mat preds = flat.t();
+    if (raw.dims != 3 || raw.type() != CV_32F)
+        throw std::runtime_error("Unexpected output tensor layout.");
 
     std::vector<cv::Rect> boxes;
     std::vector<float> confidences;
     std::vector<int> classIds;
-    for (int i = 0; i < preds.rows; ++i)
+
+    // Maps a box from letterboxed-input pixels back to the original image,
+    // clamps it to the image and records it as a candidate.
+    auto addCandidate = [&](float x1, float y1, float x2, float y2, float score, int classId)
     {
-        const float *row = preds.ptr<float>(i);
-        cv::Mat scores(1, numClasses, CV_32F, const_cast<float *>(row + 4));
-        double maxScore;
-        cv::Point classPoint;
-        cv::minMaxLoc(scores, nullptr, &maxScore, nullptr, &classPoint);
-        if (maxScore < confThresh)
-            continue;
-
-        const float cx = row[0], cy = row[1], w = row[2], h = row[3];
-        float x1 = (cx - w / 2.f - padX) / scale;
-        float y1 = (cy - h / 2.f - padY) / scale;
-        float x2 = (cx + w / 2.f - padX) / scale;
-        float y2 = (cy + h / 2.f - padY) / scale;
-        x1 = std::max(0.f, std::min(x1, static_cast<float>(image.cols - 1)));
-        y1 = std::max(0.f, std::min(y1, static_cast<float>(image.rows - 1)));
-        x2 = std::max(0.f, std::min(x2, static_cast<float>(image.cols - 1)));
-        y2 = std::max(0.f, std::min(y2, static_cast<float>(image.rows - 1)));
-
+        const float maxX = static_cast<float>(image.cols - 1);
+        const float maxY = static_cast<float>(image.rows - 1);
+        x1 = std::max(0.f, std::min((x1 - padX) / scale, maxX));
+        y1 = std::max(0.f, std::min((y1 - padY) / scale, maxY));
+        x2 = std::max(0.f, std::min((x2 - padX) / scale, maxX));
+        y2 = std::max(0.f, std::min((y2 - padY) / scale, maxY));
         boxes.emplace_back(cv::Point(static_cast<int>(x1), static_cast<int>(y1)),
                            cv::Point(static_cast<int>(x2), static_cast<int>(y2)));
-        confidences.push_back(static_cast<float>(maxScore));
-        classIds.push_back(classPoint.x);
+        confidences.push_back(score);
+        classIds.push_back(classId);
+    };
+
+    // YOLO26 exports two possible layouts:
+    //   end-to-end (default): [1, 300, 6], each row = x1, y1, x2, y2, score, class_id
+    //                         (already de-duplicated, so no NMS is needed)
+    //   end2end=False:        [1, 4 + classes, 8400], columns = cx, cy, w, h, class scores
+    //                         (needs NMS, same as YOLO11)
+    const bool endToEnd = raw.size[2] == 6;
+
+    if (endToEnd)
+    {
+        const int numDetections = raw.size[1];
+        const float *data = raw.ptr<float>();
+        for (int i = 0; i < numDetections; ++i)
+        {
+            const float *row = data + static_cast<std::size_t>(i) * 6;
+            if (row[4] < confThresh)
+                continue;
+            addCandidate(row[0], row[1], row[2], row[3], row[4], static_cast<int>(row[5]));
+        }
+    }
+    else
+    {
+        const int numChannels = raw.size[1];
+        const int numAnchors = raw.size[2];
+        const int numClasses = numChannels - 4;
+        cv::Mat flat(numChannels, numAnchors, CV_32F, const_cast<float *>(raw.ptr<float>()));
+        cv::Mat preds = flat.t();
+
+        for (int i = 0; i < preds.rows; ++i)
+        {
+            const float *row = preds.ptr<float>(i);
+            cv::Mat scores(1, numClasses, CV_32F, const_cast<float *>(row + 4));
+            double maxScore;
+            cv::Point classPoint;
+            cv::minMaxLoc(scores, nullptr, &maxScore, nullptr, &classPoint);
+            if (maxScore < confThresh)
+                continue;
+
+            const float cx = row[0], cy = row[1], w = row[2], h = row[3];
+            addCandidate(cx - w / 2.f, cy - h / 2.f, cx + w / 2.f, cy + h / 2.f,
+                         static_cast<float>(maxScore), classPoint.x);
+        }
     }
 
     std::vector<int> keep;
-    cv::dnn::NMSBoxes(boxes, confidences, confThresh, nmsThresh, keep);
+    if (endToEnd)
+    {
+        for (int i = 0; i < static_cast<int>(boxes.size()); ++i)
+            keep.push_back(i);
+    }
+    else
+    {
+        cv::dnn::NMSBoxes(boxes, confidences, confThresh, nmsThresh, keep);
+    }
+
     std::vector<Detection> detections;
     detections.reserve(keep.size());
     for (int idx : keep)
@@ -359,7 +401,7 @@ int main(int argc, char **argv)
             throw std::invalid_argument("thresholds must be between 0 and 1");
         }
 
-        cv::dnn::Net net = cv::dnn::readNetFromONNX("yolo11.onnx");
+        cv::dnn::Net net = cv::dnn::readNetFromONNX("yolo26.onnx");
         net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
         net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
 
@@ -421,7 +463,7 @@ int main(int argc, char **argv)
     }
     catch (const cv::Exception &e)
     {
-        std::cerr << "Failed to load or run yolo11.onnx: " << e.what() << "\n";
+        std::cerr << "Failed to load or run yolo26.onnx: " << e.what() << "\n";
         return 1;
     }
 }
