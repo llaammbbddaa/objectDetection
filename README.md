@@ -135,6 +135,7 @@ Everything lives in `main.cpp`:
 ├── main.cpp         # preprocessing, inference, decoding, annotation
 ├── README.md
 └── .gitignore
+└── Dockerfile 	     # i would strongly recommend just using this
 ```
 
 The model (`yolo11.onnx`) and generated outputs are not tracked in git; see `.gitignore`.
@@ -144,3 +145,30 @@ The model (`yolo11.onnx`) and generated outputs are not tracked in git; see `.gi
 ![original](image.jpg)
 ![annotated](annotated.jpg)
 
+## Docker
+
+If you'd rather not install OpenCV and Ultralytics yourself, the included `Dockerfile` builds everything (OpenCV 4.10, the detector, and the exported `yolo11.onnx` model) into a single image.
+
+### Build
+
+```
+docker build -t yolo11-detect .
+```
+
+The first build takes a while because OpenCV is compiled from source and the model is downloaded and exported. Later builds reuse Docker's cache. The build needs internet access to fetch `yolo11n.pt`.
+
+### Run
+
+Mount the folder containing your image and pass the filename:
+
+```
+docker run --rm -v "$PWD":/data yolo11-detect input.jpg
+```
+
+Optional confidence and NMS thresholds work the same as before:
+
+```
+docker run --rm -v "$PWD":/data yolo11-detect input.jpg 0.25 0.45
+```
+
+`annotated.jpg` and `detections.csv` are written to the mounted folder, so they appear in your current directory. The model is bundled in the image, so you don't need a local `yolo11.onnx`. If you place your own `yolo11.onnx` in the mounted folder, that one is used instead.
