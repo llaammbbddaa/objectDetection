@@ -384,7 +384,7 @@ static bool processImage(const std::string &imagePath, const std::string &csvPat
         const cv::Point p2(static_cast<int>(d.x2), static_cast<int>(d.y2));
         const cv::Scalar color(0, 255, 0);
 
-        cv::rectangle(annotated, p1, p2, color, 2);
+        cv::rectangle(annotated, p1, p2, color, 1); // adjusted line width so you can see object better
 
         const std::string name = (d.classId >= 0 && d.classId < static_cast<int>(CLASS_NAMES.size()))
                                      ? CLASS_NAMES[d.classId]
@@ -394,14 +394,15 @@ static bool processImage(const std::string &imagePath, const std::string &csvPat
 
         int baseline = 0;
         const cv::Size textSize =
-            cv::getTextSize(label.str(), cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+            cv::getTextSize(label.str(), cv::FONT_HERSHEY_SIMPLEX, 0.45, 1, &baseline);
         const int labelTop = std::max(p1.y - textSize.height - baseline, 0);
 
         cv::rectangle(annotated, cv::Point(p1.x, labelTop),
-                      cv::Point(p1.x + textSize.width, labelTop + textSize.height + baseline),
+                      cv::Point(p1.x + textSize.width - 1,
+                                labelTop + textSize.height + baseline - 1),
                       color, cv::FILLED);
         cv::putText(annotated, label.str(), cv::Point(p1.x, labelTop + textSize.height),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
+                    cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
     }
 
     if (!cv::imwrite(annotatedPath, annotated))
