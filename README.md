@@ -2,6 +2,41 @@
 
 A small C++ program that runs a YOLO11n object detector on an image using OpenCV's DNN module. It preprocesses the image, runs the exported ONNX model, decodes the output tensor, and produces both an annotated image and the raw detection data.
 
+![original](image.jpg)
+![annotated](annotated.jpg)
+
+## Quick start (Docker, recommended)
+
+The included `Dockerfile` builds everything for you: OpenCV 4.10, the detector, and the exported `yolo11.onnx` model. The only thing you need installed is [Docker](https://docs.docker.com/get-docker/).
+
+```bash
+git clone https://github.com/llaammbbddaa/objectDetection
+cd objectDetection
+
+# Build the image (the first build takes a while, see notes below)
+docker build -t yolo11-detect .
+
+# Run it on the example image
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/data yolo11-detect image.jpg
+```
+
+Results are written to `annotated.jpg` and `detections.csv` in your current directory, and the detections are also printed to the console.
+
+To run on your own image, put it in the folder you mount and pass its filename. Optional confidence and NMS thresholds go after it:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/data yolo11-detect my_photo.jpg 0.25 0.45
+#                                                                                      ^conf ^nms
+```
+
+Notes:
+
+- **First build is slow.** OpenCV is compiled from source and the model is downloaded and exported. Later builds reuse Docker's cache.
+- **The build needs internet access** to fetch the OpenCV source and `yolo11n.pt`.
+- **The model is bundled in the image**, so you don't need a local `yolo11.onnx`. If you place your own `yolo11.onnx` in the mounted folder, that one is used instead.
+- **`--user "$(id -u):$(id -g)"`** makes the output files owned by you rather than root. It's optional.
+- **Your image must be inside the mounted folder**, because the container only sees what you mount at `/data`.
+
 ## What it does
 
 Given an input image, the program:
@@ -27,7 +62,16 @@ Each detection has the following fields:
 | `class_id` | COCO class index (0-79) |
 | `class_name` | Human-readable class name (CSV and console only) |
 
-## Getting started
+### Run options
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `conf` | `0.25` | Minimum class score to keep a detection |
+| `nms` | `0.45` | IoU threshold for suppressing overlapping boxes |
+
+## Manual setup (without Docker)
+
+Only follow this section if you can't or don't want to use Docker.
 
 ### Requirements
 
@@ -93,17 +137,12 @@ Place `yolo11.onnx` in the directory you run from, then:
 ./build/yolo11_detect input.jpg
 ```
 
-Optional arguments set the confidence and NMS thresholds:
+With optional thresholds:
 
 ```bash
 ./build/yolo11_detect input.jpg 0.25 0.45
 #                               ^conf ^nms
 ```
-
-| Argument | Default | Meaning |
-|---|---|---|
-| `conf` | `0.25` | Minimum class score to keep a detection |
-| `nms` | `0.45` | IoU threshold for suppressing overlapping boxes |
 
 Results are written to `annotated.jpg` and `detections.csv` in the current directory.
 
@@ -122,53 +161,31 @@ Everything lives in `main.cpp`:
 
 ## Troubleshooting
 
+**Docker**
+
+- **`docker build` fails while downloading:** the build needs internet access to fetch the OpenCV source and `yolo11n.pt`. Check your connection or proxy settings and retry.
+- **Input image not found:** the container only sees the folder you mount with `-v "$PWD":/data`. Make sure the image is in that folder and you pass just its filename.
+- **Output files are owned by root:** add `--user "$(id -u):$(id -g)"` to the `docker run` command.
+
+**Manual setup**
+
 - **`Failed to load yolo11.onnx`**: the model file isn't in the directory you ran the program from, or it's misnamed.
 - **Assertion failure in `shape_utils.hpp` during inference**: your OpenCV is too old; see the note under Requirements.
 - **CMake can't find OpenCV**: point it at your install with `-DOpenCV_DIR=<path to lib/cmake/opencv4>`.
-- **No detections**: try lowering the confidence threshold, e.g. `./build/yolo11_detect input.jpg 0.1`.
+
+**Both**
+
+- **No detections**: try lowering the confidence threshold, e.g. `yolo11-detect image.jpg 0.1` (or `./build/yolo11_detect image.jpg 0.1` without Docker).
 
 ## Project structure
 
 ```
 .
 ├── CMakeLists.txt   # build configuration
+├── Dockerfile       # builds OpenCV, the detector and the model (recommended way to run)
 ├── main.cpp         # preprocessing, inference, decoding, annotation
 ├── README.md
 └── .gitignore
-└── Dockerfile 	     # i would strongly recommend just using this
 ```
 
 The model (`yolo11.onnx`) and generated outputs are not tracked in git; see `.gitignore`.
-
-# example
-
-![original](image.jpg)
-![annotated](annotated.jpg)
-
-## Docker
-
-If you'd rather not install OpenCV and Ultralytics yourself, the included `Dockerfile` builds everything (OpenCV 4.10, the detector, and the exported `yolo11.onnx` model) into a single image.
-
-### Build
-
-```
-docker build -t yolo11-detect .
-```
-
-The first build takes a while because OpenCV is compiled from source and the model is downloaded and exported. Later builds reuse Docker's cache. The build needs internet access to fetch `yolo11n.pt`.
-
-### Run
-
-Mount the folder containing your image and pass the filename:
-
-```
-docker run --rm -v "$PWD":/data yolo11-detect input.jpg
-```
-
-Optional confidence and NMS thresholds work the same as before:
-
-```
-docker run --rm -v "$PWD":/data yolo11-detect input.jpg 0.25 0.45
-```
-
-`annotated.jpg` and `detections.csv` are written to the mounted folder, so they appear in your current directory. The model is bundled in the image, so you don't need a local `yolo11.onnx`. If you place your own `yolo11.onnx` in the mounted folder, that one is used instead.
