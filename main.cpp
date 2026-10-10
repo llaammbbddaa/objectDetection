@@ -21,6 +21,7 @@
 #include <opencv2/dnn.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cerrno>
 #include <fstream>
@@ -297,6 +298,7 @@ static bool processImage(const std::string &imagePath, const std::string &csvPat
         return false;
     }
 
+    const auto detectionStart = std::chrono::steady_clock::now();
     std::vector<Detection> detections;
     if (tileColumns > 0 && tileRows > 0)
     {
@@ -338,6 +340,10 @@ static bool processImage(const std::string &imagePath, const std::string &csvPat
         detections = detectTile(image, net, confThresh, nmsThresh);
     }
 
+    const double detectionTimeMs =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - detectionStart)
+            .count();
+
     // ------------------------------------------------- output tensor (N x 6)
     // Columns: x1, y1, x2, y2, confidence, class_id
     cv::Mat tensor(static_cast<int>(detections.size()), 6, CV_32F);
@@ -359,7 +365,7 @@ static bool processImage(const std::string &imagePath, const std::string &csvPat
         std::cerr << "Could not open CSV output: " << csvPath << "\n";
         return false;
     }
-    csv << "x1,y1,x2,y2,confidence,class_id,class_name\n";
+    csv << "x1,y1,x2,y2,confidence,class_id,class_name,resolutionX,resolutionY,detection_time\n";
 
     std::cout << imagePath << ": " << detections.size() << " detections\n";
 
@@ -372,8 +378,9 @@ static bool processImage(const std::string &imagePath, const std::string &csvPat
         csv << std::fixed << std::setprecision(2)
             << d.x1 << "," << d.y1 << "," << d.x2 << "," << d.y2 << ","
             << std::setprecision(4) << d.confidence << ","
-            << d.classId << "," << name << "\n";
-
+            << d.classId << "," << name << ","
+            << image.cols << "," << image.rows << ","
+            << std::setprecision(3) << detectionTimeMs << "\n";
     }
 
     // ------------------------------------------------------------ annotate
