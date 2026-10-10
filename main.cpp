@@ -5,21 +5,27 @@
 //
 // Usage:
 //   ./yolo11_detect <input_image> [conf_thresh=0.25] [nms_thresh=0.45]
+//   ./yolo11_detect <input_directory> <csv_directory> <annotated_directory>
+//                   [conf_thresh=0.25] [nms_thresh=0.45]
 //
 // Outputs:
 //   annotated.jpg   - original image with boxes + labels drawn
 //   detections.csv  - one row per detection: x1,y1,x2,y2,confidence,class_id,class_name
+//   For directory input, one CSV and one annotated image are written per image.
 //   (the same tensor is also printed to the console)
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 
 static const int INPUT_SIZE = 640;
@@ -64,98 +70,96 @@ struct Detection
     int classId;
 };
 
-int main(int argc, char **argv)
+static bool isDirectory(const std::string &path)
 {
-    if (argc < 2)
-    {
-        std::cerr << "Usage: " << argv[0]
-                  << " <input_image> [conf_thresh=0.25] [nms_thresh=0.45]\n";
-        return 1;
-    }
+    struct stat info;
+    return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
+}
 
-    const std::string imagePath = argv[1];
-    const float confThresh = (argc > 2) ? std::stof(argv[2]) : 0.25f;
-    const float nmsThresh = (argc > 3) ? std::stof(argv[3]) : 0.45f;
+static bool makeDirectory(const std::string &path)
+{
+    if (path.empty() || isDirectory(path))
+        return true;
 
-    // ---------------------------------------------------------------- load
-    cv::Mat image = cv::imread(imagePath, cv::IMREAD_COLOR);
-    if (image.empty())
-    {
-        std::cerr << "Could not read image: " << imagePath << "\n";
-        return 1;
-    }
+    const std::size_t separator = path.find_last_of('/');
+    if (separator != std::string::npos && separator > 0 &&
+        !makeDirectory(path.substr(0, separator)))
+        return false;
 
-    cv::dnn::Net net;
-    try
-    {
-        net = cv::dnn::readNetFromONNX("yolo11.onnx");
-    }
-    catch (const cv::Exception &e)
-    {
-        std::cerr << "Failed to load yolo11.onnx: " << e.what() << "\n";
-        return 1;
-    }
-    net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-    net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+    if (mkdir(path.c_str(), 0755) == 0)
+        return true;
+    return errno == EEXIST && isDirectory(path);
+}
 
-    // ---------------------------------------------------------- preprocess
+static std::string joinPath(const std::string &directory, const std::string &name)
+{
+    if (directory.empty() || directory == ".")
+        return name;
+    return directory.back() == '/' ? directory + name : directory + "/" + name;
+}
+
+static std::string fileStem(const std::string &path)
+{
+    const std::size_t slash = path.find_last_of('/');
+    const std::size_t dot = path.find_last_of('.');
+    const std::size_t nameStart = slash == std::string::npos ? 0 : slash + 1;
+    if (dot == std::string::npos || dot < nameStart)
+        return path.substr(nameStart);
+    return path.substr(nameStart, dot - nameStart);
+}
+
+static std::string fileExtension(const std::string &path)
+{
+    const std::size_t slash = path.find_last_of('/');
+    const std::size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
+        return ".jpg";
+    return path.substr(dot);
+}
+
+static std::vector<Detection> detectTile(const cv::Mat &image, cv::dnn::Net &net,
+                                         float confThresh, float nmsThresh)
+{
     float scale;
     int padX, padY;
     cv::Mat letterboxed = letterbox(image, INPUT_SIZE, scale, padX, padY);
 
-    // 1/255 scaling, BGR -> RGB, no crop  =>  NCHW float blob [1,3,640,640]
     cv::Mat blob;
     cv::dnn::blobFromImage(letterboxed, blob, 1.0 / 255.0,
                            cv::Size(INPUT_SIZE, INPUT_SIZE), cv::Scalar(),
                            /*swapRB=*/true, /*crop=*/false);
 
-    // ----------------------------------------------------------- inference
     net.setInput(blob);
     std::vector<cv::Mat> outputs;
     net.forward(outputs, net.getUnconnectedOutLayersNames());
-
     if (outputs.empty())
-    {
-        std::cerr << "Network produced no output.\n";
-        return 1;
-    }
+        throw std::runtime_error("Network produced no output.");
 
-    // YOLO11 detect output: [1, 4 + numClasses, numAnchors] = [1, 84, 8400]
-    // Each column is: cx, cy, w, h, class0 ... class79 (no objectness score).
     const cv::Mat &raw = outputs[0];
     const int numChannels = raw.size[1];
     const int numAnchors = raw.size[2];
     const int numClasses = numChannels - 4;
-
-    // Flatten to 84 x 8400, then transpose to 8400 x 84 so each row is one anchor.
     cv::Mat flat(numChannels, numAnchors, CV_32F, const_cast<float *>(raw.ptr<float>()));
     cv::Mat preds = flat.t();
 
-    // -------------------------------------------------------- decode boxes
     std::vector<cv::Rect> boxes;
     std::vector<float> confidences;
     std::vector<int> classIds;
-
     for (int i = 0; i < preds.rows; ++i)
     {
         const float *row = preds.ptr<float>(i);
-
         cv::Mat scores(1, numClasses, CV_32F, const_cast<float *>(row + 4));
         double maxScore;
         cv::Point classPoint;
         cv::minMaxLoc(scores, nullptr, &maxScore, nullptr, &classPoint);
-
         if (maxScore < confThresh)
             continue;
 
         const float cx = row[0], cy = row[1], w = row[2], h = row[3];
-
-        // Undo letterbox: remove padding, divide by scale, clamp to image.
         float x1 = (cx - w / 2.f - padX) / scale;
         float y1 = (cy - h / 2.f - padY) / scale;
         float x2 = (cx + w / 2.f - padX) / scale;
         float y2 = (cy + h / 2.f - padY) / scale;
-
         x1 = std::max(0.f, std::min(x1, static_cast<float>(image.cols - 1)));
         y1 = std::max(0.f, std::min(y1, static_cast<float>(image.rows - 1)));
         x2 = std::max(0.f, std::min(x2, static_cast<float>(image.cols - 1)));
@@ -167,10 +171,8 @@ int main(int argc, char **argv)
         classIds.push_back(classPoint.x);
     }
 
-    // Non-max suppression (class-aware via per-class NMS)
     std::vector<int> keep;
     cv::dnn::NMSBoxes(boxes, confidences, confThresh, nmsThresh, keep);
-
     std::vector<Detection> detections;
     detections.reserve(keep.size());
     for (int idx : keep)
@@ -180,6 +182,68 @@ int main(int argc, char **argv)
                               static_cast<float>(b.x + b.width),
                               static_cast<float>(b.y + b.height),
                               confidences[idx], classIds[idx]});
+    }
+    return detections;
+}
+
+static bool processImage(const std::string &imagePath, const std::string &csvPath,
+                         const std::string &annotatedPath, cv::dnn::Net &net,
+                         float confThresh, float nmsThresh, bool splitIntoTiles)
+{
+    cv::Mat image = cv::imread(imagePath, cv::IMREAD_COLOR);
+    if (image.empty())
+    {
+        std::cerr << "Could not read image: " << imagePath << "\n";
+        return false;
+    }
+
+    std::vector<Detection> detections;
+    if (splitIntoTiles)
+    {
+        const int halfWidth = (image.cols + 1) / 2;
+        const int halfHeight = (image.rows + 1) / 2;
+        const std::vector<cv::Rect> tiles = {
+            cv::Rect(0, 0, halfWidth, halfHeight),
+            cv::Rect(halfWidth, 0, image.cols - halfWidth, halfHeight),
+            cv::Rect(0, halfHeight, halfWidth, image.rows - halfHeight),
+            cv::Rect(halfWidth, halfHeight, image.cols - halfWidth,
+                     image.rows - halfHeight)};
+
+        for (const cv::Rect &tile : tiles)
+        {
+            if (tile.width == 0 || tile.height == 0)
+                continue;
+            for (Detection detection : detectTile(image(tile), net, confThresh, nmsThresh))
+            {
+                detection.x1 += tile.x;
+                detection.x2 += tile.x;
+                detection.y1 += tile.y;
+                detection.y2 += tile.y;
+                detections.push_back(detection);
+            }
+        }
+
+        // Suppress duplicate boxes from detections near quadrant boundaries.
+        std::vector<cv::Rect> boxes;
+        std::vector<float> confidences;
+        for (const Detection &detection : detections)
+        {
+            boxes.emplace_back(
+                cv::Point(static_cast<int>(detection.x1), static_cast<int>(detection.y1)),
+                cv::Point(static_cast<int>(detection.x2), static_cast<int>(detection.y2)));
+            confidences.push_back(detection.confidence);
+        }
+        std::vector<int> keep;
+        cv::dnn::NMSBoxes(boxes, confidences, confThresh, nmsThresh, keep);
+        std::vector<Detection> filtered;
+        filtered.reserve(keep.size());
+        for (int index : keep)
+            filtered.push_back(detections[index]);
+        detections.swap(filtered);
+    }
+    else
+    {
+        detections = detectTile(image, net, confThresh, nmsThresh);
     }
 
     // ------------------------------------------------- output tensor (N x 6)
@@ -197,14 +261,15 @@ int main(int argc, char **argv)
         r[5] = static_cast<float>(d.classId);
     }
 
-    std::ofstream csv("detections.csv");
+    std::ofstream csv(csvPath);
+    if (!csv)
+    {
+        std::cerr << "Could not open CSV output: " << csvPath << "\n";
+        return false;
+    }
     csv << "x1,y1,x2,y2,confidence,class_id,class_name\n";
 
-    std::cout << "Detections: " << detections.size() << "\n";
-    std::cout << std::left << std::setw(8) << "x1" << std::setw(8) << "y1"
-              << std::setw(8) << "x2" << std::setw(8) << "y2"
-              << std::setw(12) << "confidence" << std::setw(10) << "class_id"
-              << "class_name\n";
+    std::cout << imagePath << ": " << detections.size() << " detections\n";
 
     for (const Detection &d : detections)
     {
@@ -217,11 +282,6 @@ int main(int argc, char **argv)
             << std::setprecision(4) << d.confidence << ","
             << d.classId << "," << name << "\n";
 
-        std::cout << std::fixed << std::setprecision(1) << std::left
-                  << std::setw(8) << d.x1 << std::setw(8) << d.y1
-                  << std::setw(8) << d.x2 << std::setw(8) << d.y2
-                  << std::setprecision(4) << std::setw(12) << d.confidence
-                  << std::setw(10) << d.classId << name << "\n";
     }
 
     // ------------------------------------------------------------ annotate
@@ -252,7 +312,116 @@ int main(int argc, char **argv)
                     cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
     }
 
-    cv::imwrite("annotated.jpg", annotated);
-    std::cout << "\nSaved annotated.jpg and detections.csv\n";
-    return 0;
+    if (!cv::imwrite(annotatedPath, annotated))
+    {
+        std::cerr << "Could not write annotated image: " << annotatedPath << "\n";
+        return false;
+    }
+    std::cout << "  CSV: " << csvPath << "\n"
+              << "  Image: " << annotatedPath << "\n";
+    return true;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 2)
+    {
+        std::cerr << "Usage: " << argv[0]
+                  << " <input_image> [conf_thresh=0.25] [nms_thresh=0.45]\n"
+                  << "       " << argv[0]
+                  << " <input_directory> <csv_directory> <annotated_directory>"
+                  << " [conf_thresh=0.25] [nms_thresh=0.45]\n";
+        return 1;
+    }
+
+    const std::string inputPath = argv[1];
+    const bool directoryMode = isDirectory(inputPath);
+    const std::string csvDirectory = directoryMode
+                                         ? (argc > 2 ? argv[2] : "csv_output")
+                                         : ".";
+    const std::string annotatedDirectory = directoryMode
+                                               ? (argc > 3 ? argv[3] : "annotated_output")
+                                               : ".";
+    const int thresholdIndex = directoryMode ? 4 : 2;
+
+    try
+    {
+        const float confThresh = argc > thresholdIndex
+                                     ? std::stof(argv[thresholdIndex])
+                                     : 0.25f;
+        const float nmsThresh = argc > thresholdIndex + 1
+                                    ? std::stof(argv[thresholdIndex + 1])
+                                    : 0.45f;
+
+        if (confThresh < 0.0f || confThresh > 1.0f || nmsThresh < 0.0f ||
+            nmsThresh > 1.0f)
+        {
+            throw std::invalid_argument("thresholds must be between 0 and 1");
+        }
+
+        cv::dnn::Net net = cv::dnn::readNetFromONNX("yolo11.onnx");
+        net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+        net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+
+        if (!directoryMode)
+        {
+            return processImage(inputPath, "detections.csv", "annotated.jpg", net,
+                                confThresh, nmsThresh, false)
+                       ? 0
+                       : 1;
+        }
+
+        if (!makeDirectory(csvDirectory) || !makeDirectory(annotatedDirectory))
+        {
+            std::cerr << "Could not create output directories.\n";
+            return 1;
+        }
+
+        std::vector<cv::String> paths;
+        cv::glob(joinPath(inputPath, "*"), paths, false);
+        std::sort(paths.begin(), paths.end());
+
+        int processed = 0;
+        int failed = 0;
+        for (const cv::String &path : paths)
+        {
+            if (isDirectory(path))
+                continue;
+
+            const std::string stem = fileStem(path);
+            const std::string csvPath = joinPath(csvDirectory, stem + ".csv");
+            const std::string annotatedPath =
+                joinPath(annotatedDirectory, stem + "_annotated" + fileExtension(path));
+            if (processImage(path, csvPath, annotatedPath, net, confThresh, nmsThresh, true))
+                ++processed;
+            else
+                ++failed;
+        }
+
+        if (processed == 0)
+        {
+            std::cerr << "No readable images found in: " << inputPath << "\n";
+            return 1;
+        }
+        std::cout << "Processed " << processed << " image(s)";
+        if (failed != 0)
+            std::cout << "; " << failed << " failed";
+        std::cout << ".\n";
+        return failed == 0 ? 0 : 1;
+    }
+    catch (const std::invalid_argument &e)
+    {
+        std::cerr << "Invalid argument: " << e.what() << "\n";
+        return 1;
+    }
+    catch (const std::runtime_error &e)
+    {
+        std::cerr << "Inference failed: " << e.what() << "\n";
+        return 1;
+    }
+    catch (const cv::Exception &e)
+    {
+        std::cerr << "Failed to load or run yolo11.onnx: " << e.what() << "\n";
+        return 1;
+    }
 }

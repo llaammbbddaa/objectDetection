@@ -36,3 +36,7 @@ yolo11_detect
 # OS files
 .DS_Store
 Thumbs.db
+
+testFlight1/
+annotated_output/
+csv_output/

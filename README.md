@@ -29,6 +29,20 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/data yolo11-detect my_phot
 #                                                                                      ^conf ^nms
 ```
 
+To process every image in a directory, pass separate output directories for
+the CSV files and annotated images:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/data yolo11-detect \
+  images csv_output annotated_output 0.25 0.45
+#       ^input  ^CSV output ^image output ^conf ^nms
+```
+
+The output directories are created when needed. Each input image produces
+`<name>.csv` in the CSV directory and `<name>_annotated.<extension>` in the
+annotated-image directory. Files that are not readable images are skipped and
+reported.
+
 Notes:
 
 - **First build is slow.** OpenCV is compiled from source and the model is downloaded and exported. Later builds reuse Docker's cache.
@@ -49,6 +63,14 @@ Given an input image, the program:
    - `annotated.jpg`: the original image with labeled bounding boxes
    - `detections.csv`: one row per detection
    - The same data printed to the console
+
+When the input is a directory, the same processing is applied independently to
+each image in that directory. Each source image is divided into four
+quadrants before inference. Detections from each quadrant are translated back
+to the original image coordinates, merged, and annotated on the full-size
+source image. The CSV and annotated-image output locations are provided as the
+second and third arguments. If omitted, they default to `csv_output` and
+`annotated_output`.
 
 ### Output format
 
@@ -145,6 +167,13 @@ With optional thresholds:
 ```
 
 Results are written to `annotated.jpg` and `detections.csv` in the current directory.
+
+For a directory:
+
+```bash
+./build/yolo11_detect images csv_output annotated_output
+./build/yolo11_detect images csv_output annotated_output 0.25 0.45
+```
 
 ## Code overview
 
