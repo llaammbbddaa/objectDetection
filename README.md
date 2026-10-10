@@ -29,6 +29,18 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/data yolo26-detect my_phot
 #                                                                                      ^conf ^nms
 ```
 
+To subdivide an image before inference, provide its resolution with
+`--resolution WIDTHxHEIGHT`. The program uses
+`ceil(width / 640) * ceil(height / 640)` evenly spaced tiles, translates
+detections back to the original image, and applies NMS to remove duplicates:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/data yolo26-detect \
+  my_photo.jpg --resolution 1280x720
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/data yolo26-detect \
+  my_photo.jpg --resolution 2048x1080 0.25 0.45
+```
+
 To process every image in a directory, pass separate output directories for
 the CSV files and annotated images:
 
@@ -66,9 +78,11 @@ Given an input image, the program:
    - The same data printed to the console
 
 When the input is a directory, the same processing is applied independently to
-each image in that directory. Each source image is divided into four
-quadrants before inference. Detections from each quadrant are translated back
-to the original image coordinates, merged (with NMS to remove duplicates across quadrant borders), and annotated on the full-size
+each image in that directory. Without `--resolution`, each source image is
+divided into four quadrants before inference. With `--resolution`, it is
+divided into `ceil(width / 640) * ceil(height / 640)` tiles. Detections from
+each tile are translated back to the original image coordinates, merged (with
+NMS to remove duplicates across tile borders), and annotated on the full-size
 source image. The CSV and annotated-image output locations are provided as the
 second and third arguments. If omitted, they default to `csv_output` and
 `annotated_output`.
@@ -90,7 +104,8 @@ Each detection has the following fields:
 | Argument | Default | Meaning |
 |---|---|---|
 | `conf` | `0.25` | Minimum class score to keep a detection |
-| `nms` | `0.45` | IoU threshold for suppressing overlapping boxes. Only used for the classic export layout and for merging quadrants in directory mode; a single image with the default end-to-end model ignores it |
+| `nms` | `0.45` | IoU threshold for suppressing overlapping boxes. Only used for the classic export layout and for merging tiles in split mode; a single image with the default end-to-end model ignores it |
+| `--resolution WIDTHxHEIGHT` | unset | Use `ceil(width / 640) * ceil(height / 640)` evenly spaced inference tiles; output coordinates remain relative to the original image |
 
 ## Manual setup (without Docker)
 
@@ -176,6 +191,13 @@ With optional thresholds:
 #                               ^conf ^nms
 ```
 
+To use resolution-driven tiling:
+
+```bash
+./build/yolo26_detect input.jpg --resolution 1280x720
+./build/yolo26_detect input.jpg --resolution 2048x1080 0.25 0.45
+```
+
 Results are written to `annotated.jpg` and `detections.csv` in the current directory.
 
 For a directory:
@@ -183,6 +205,7 @@ For a directory:
 ```bash
 ./build/yolo26_detect images csv_output annotated_output
 ./build/yolo26_detect images csv_output annotated_output 0.25 0.45
+./build/yolo26_detect images csv_output annotated_output --resolution 2048x1080
 ```
 
 ## Code overview
@@ -195,7 +218,7 @@ Everything lives in `main.cpp`:
 | `blobFromImage()` | Converts the image to a `[1,3,640,640]` float blob (1/255 scale, BGR to RGB) |
 | `net.forward()` | Runs the model and returns either the `[1,300,6]` end-to-end output or the classic `[1,84,8400]` output |
 | Decode step | End-to-end layout: reads each `x1,y1,x2,y2,score,class` row, filters by confidence and undoes the letterbox. Classic layout: transposes the output, finds the best class per row, converts center/size boxes to corners, then undoes the letterbox |
-| `cv::dnn::NMSBoxes()` | Removes overlapping duplicates (classic layout, and merging quadrants in directory mode) |
+| `cv::dnn::NMSBoxes()` | Removes overlapping duplicates (classic layout, and merging tiles in split mode) |
 | Output section | Builds the N x 6 tensor, writes the CSV and console table, and draws the annotated image |
 
 ## Troubleshooting

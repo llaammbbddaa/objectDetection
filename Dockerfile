@@ -122,4 +122,5 @@ CMD ["input.jpg"]
 
 # Build:  docker build -t yolo26-detect .
 # Run:    docker run --rm -v "$PWD":/data yolo26-detect input.jpg 0.25 0.45
+# Tile:   docker run --rm -v "$PWD":/data yolo26-detect input.jpg --resolution 1280x720
 #         (results: annotated.jpg and detections.csv appear in your $PWD)

@@ -7,8 +7,9 @@
 //
 // Usage:
 //   ./yolo26_detect <input_image> [conf_thresh=0.25] [nms_thresh=0.45]
+//                   [--resolution WIDTHxHEIGHT]
 //   ./yolo26_detect <input_directory> <csv_directory> <annotated_directory>
-//                   [conf_thresh=0.25] [nms_thresh=0.45]
+//                   [conf_thresh=0.25] [nms_thresh=0.45] [--resolution WIDTHxHEIGHT]
 //
 // Outputs:
 //   annotated.jpg   - original image with boxes + labels drawn
@@ -20,6 +21,7 @@
 #include <opencv2/dnn.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cerrno>
 #include <fstream>
 #include <iomanip>
@@ -117,6 +119,62 @@ static std::string fileExtension(const std::string &path)
     if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
         return ".jpg";
     return path.substr(dot);
+}
+
+struct Resolution
+{
+    int width;
+    int height;
+};
+
+static Resolution parseResolution(const std::string &value)
+{
+    const std::size_t separator = value.find('x');
+    if (separator == std::string::npos || separator == 0 || separator == value.size() - 1)
+        throw std::invalid_argument("resolution must have the form WIDTHxHEIGHT");
+
+    std::size_t widthCharacters = 0;
+    std::size_t heightCharacters = 0;
+    int width;
+    int height;
+    try
+    {
+        width = std::stoi(value.substr(0, separator), &widthCharacters);
+        height = std::stoi(value.substr(separator + 1), &heightCharacters);
+    }
+    catch (const std::exception &)
+    {
+        throw std::invalid_argument("resolution must have the form WIDTHxHEIGHT");
+    }
+
+    if (widthCharacters != separator || heightCharacters != value.size() - separator - 1 ||
+        width <= 0 || height <= 0)
+    {
+        throw std::invalid_argument("resolution must have the form WIDTHxHEIGHT");
+    }
+    return {width, height};
+}
+
+static std::vector<cv::Rect> makeTiles(const cv::Size &imageSize, int columns, int rows)
+{
+    std::vector<cv::Rect> tiles;
+    tiles.reserve(static_cast<std::size_t>(columns) * rows);
+    for (int row = 0; row < rows; ++row)
+    {
+        const int y0 = static_cast<int>((static_cast<long long>(row) * imageSize.height) / rows);
+        const int y1 =
+            static_cast<int>((static_cast<long long>(row + 1) * imageSize.height) / rows);
+        for (int column = 0; column < columns; ++column)
+        {
+            const int x0 =
+                static_cast<int>((static_cast<long long>(column) * imageSize.width) / columns);
+            const int x1 = static_cast<int>(
+                (static_cast<long long>(column + 1) * imageSize.width) / columns);
+            if (x1 > x0 && y1 > y0)
+                tiles.emplace_back(x0, y0, x1 - x0, y1 - y0);
+        }
+    }
+    return tiles;
 }
 
 static std::vector<Detection> detectTile(const cv::Mat &image, cv::dnn::Net &net,
@@ -230,7 +288,7 @@ static std::vector<Detection> detectTile(const cv::Mat &image, cv::dnn::Net &net
 
 static bool processImage(const std::string &imagePath, const std::string &csvPath,
                          const std::string &annotatedPath, cv::dnn::Net &net,
-                         float confThresh, float nmsThresh, bool splitIntoTiles)
+                         float confThresh, float nmsThresh, int tileColumns, int tileRows)
 {
     cv::Mat image = cv::imread(imagePath, cv::IMREAD_COLOR);
     if (image.empty())
@@ -240,21 +298,13 @@ static bool processImage(const std::string &imagePath, const std::string &csvPat
     }
 
     std::vector<Detection> detections;
-    if (splitIntoTiles)
+    if (tileColumns > 0 && tileRows > 0)
     {
-        const int halfWidth = (image.cols + 1) / 2;
-        const int halfHeight = (image.rows + 1) / 2;
-        const std::vector<cv::Rect> tiles = {
-            cv::Rect(0, 0, halfWidth, halfHeight),
-            cv::Rect(halfWidth, 0, image.cols - halfWidth, halfHeight),
-            cv::Rect(0, halfHeight, halfWidth, image.rows - halfHeight),
-            cv::Rect(halfWidth, halfHeight, image.cols - halfWidth,
-                     image.rows - halfHeight)};
+        const std::vector<cv::Rect> tiles =
+            makeTiles(image.size(), tileColumns, tileRows);
 
         for (const cv::Rect &tile : tiles)
         {
-            if (tile.width == 0 || tile.height == 0)
-                continue;
             for (Detection detection : detectTile(image(tile), net, confThresh, nmsThresh))
             {
                 detection.x1 += tile.x;
@@ -265,7 +315,7 @@ static bool processImage(const std::string &imagePath, const std::string &csvPat
             }
         }
 
-        // Suppress duplicate boxes from detections near quadrant boundaries.
+        // Suppress duplicate boxes from detections near tile boundaries.
         std::vector<cv::Rect> boxes;
         std::vector<float> confidences;
         for (const Detection &detection : detections)
@@ -369,31 +419,62 @@ int main(int argc, char **argv)
     if (argc < 2)
     {
         std::cerr << "Usage: " << argv[0]
-                  << " <input_image> [conf_thresh=0.25] [nms_thresh=0.45]\n"
+                  << " <input_image> [conf_thresh=0.25] [nms_thresh=0.45]"
+                  << " [--resolution WIDTHxHEIGHT]\n"
                   << "       " << argv[0]
                   << " <input_directory> <csv_directory> <annotated_directory>"
-                  << " [conf_thresh=0.25] [nms_thresh=0.45]\n";
+                  << " [conf_thresh=0.25] [nms_thresh=0.45] [--resolution WIDTHxHEIGHT]\n";
         return 1;
     }
 
-    const std::string inputPath = argv[1];
-    const bool directoryMode = isDirectory(inputPath);
-    const std::string csvDirectory = directoryMode
-                                         ? (argc > 2 ? argv[2] : "csv_output")
-                                         : ".";
-    const std::string annotatedDirectory = directoryMode
-                                               ? (argc > 3 ? argv[3] : "annotated_output")
-                                               : ".";
-    const int thresholdIndex = directoryMode ? 4 : 2;
-
     try
     {
-        const float confThresh = argc > thresholdIndex
-                                     ? std::stof(argv[thresholdIndex])
+        std::vector<std::string> positional;
+        Resolution resolution{0, 0};
+        bool hasResolution = false;
+        for (int i = 1; i < argc; ++i)
+        {
+            const std::string argument = argv[i];
+            if (argument == "--resolution")
+            {
+                if (hasResolution || i + 1 >= argc)
+                    throw std::invalid_argument("--resolution requires WIDTHxHEIGHT");
+                resolution = parseResolution(argv[++i]);
+                hasResolution = true;
+            }
+            else if (argument.rfind("--resolution=", 0) == 0)
+            {
+                if (hasResolution)
+                    throw std::invalid_argument("resolution specified more than once");
+                resolution = parseResolution(argument.substr(13));
+                hasResolution = true;
+            }
+            else
+            {
+                positional.push_back(argument);
+            }
+        }
+
+        if (positional.empty())
+            throw std::invalid_argument("an input image or directory is required");
+
+        const std::string inputPath = positional[0];
+        const bool directoryMode = isDirectory(inputPath);
+        positional.erase(positional.begin());
+        const std::string csvDirectory =
+            directoryMode ? (positional.size() > 0 ? positional[0] : "csv_output") : ".";
+        const std::string annotatedDirectory =
+            directoryMode ? (positional.size() > 1 ? positional[1] : "annotated_output") : ".";
+        const std::size_t thresholdOffset = directoryMode ? 2 : 0;
+        const float confThresh = positional.size() > thresholdOffset
+                                     ? std::stof(positional[thresholdOffset])
                                      : 0.25f;
-        const float nmsThresh = argc > thresholdIndex + 1
-                                    ? std::stof(argv[thresholdIndex + 1])
+        const float nmsThresh = positional.size() > thresholdOffset + 1
+                                    ? std::stof(positional[thresholdOffset + 1])
                                     : 0.45f;
+
+        if (positional.size() > thresholdOffset + 2)
+            throw std::invalid_argument("too many positional arguments");
 
         if (confThresh < 0.0f || confThresh > 1.0f || nmsThresh < 0.0f ||
             nmsThresh > 1.0f)
@@ -407,8 +488,16 @@ int main(int argc, char **argv)
 
         if (!directoryMode)
         {
+            const int tileColumns =
+                hasResolution ? static_cast<int>(std::ceil(
+                                    static_cast<double>(resolution.width) / INPUT_SIZE))
+                              : 0;
+            const int tileRows =
+                hasResolution ? static_cast<int>(std::ceil(
+                                    static_cast<double>(resolution.height) / INPUT_SIZE))
+                              : 0;
             return processImage(inputPath, "detections.csv", "annotated.jpg", net,
-                                confThresh, nmsThresh, false)
+                                confThresh, nmsThresh, tileColumns, tileRows)
                        ? 0
                        : 1;
         }
@@ -423,6 +512,17 @@ int main(int argc, char **argv)
         cv::glob(joinPath(inputPath, "*"), paths, false);
         std::sort(paths.begin(), paths.end());
 
+        const int tileColumns =
+            hasResolution
+                ? static_cast<int>(
+                      std::ceil(static_cast<double>(resolution.width) / INPUT_SIZE))
+                : 2;
+        const int tileRows =
+            hasResolution
+                ? static_cast<int>(
+                      std::ceil(static_cast<double>(resolution.height) / INPUT_SIZE))
+                : 2;
+
         int processed = 0;
         int failed = 0;
         for (const cv::String &path : paths)
@@ -434,7 +534,8 @@ int main(int argc, char **argv)
             const std::string csvPath = joinPath(csvDirectory, stem + ".csv");
             const std::string annotatedPath =
                 joinPath(annotatedDirectory, stem + "_annotated" + fileExtension(path));
-            if (processImage(path, csvPath, annotatedPath, net, confThresh, nmsThresh, true))
+            if (processImage(path, csvPath, annotatedPath, net, confThresh, nmsThresh,
+                             tileColumns, tileRows))
                 ++processed;
             else
                 ++failed;
