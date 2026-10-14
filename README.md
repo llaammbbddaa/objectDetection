@@ -2,9 +2,6 @@
 
 A small C++ program that runs a YOLO11n object detector on an image using OpenCV's DNN module. It preprocesses the image, runs the exported ONNX model, decodes the output tensor, and produces both an annotated image and the raw detection data.
 
-![original](image.jpg)
-![annotated](annotated.jpg)
-
 ## Quick start (Docker, recommended)
 
 The included `Dockerfile` builds everything for you: OpenCV 4.10, the detector, and the exported `yolo11.onnx` model. The only thing you need installed is [Docker](https://docs.docker.com/get-docker/).
