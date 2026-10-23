@@ -2,7 +2,7 @@
 
 # YOLO26 object detection (C++ / OpenCV DNN)
 # Stages:
-#   1. opencv-build : builds OpenCV 4.11.0 (core, imgproc, imgcodecs, dnn only)
+#   1. opencv-build : builds OpenCV 4.11.0 (core, imgproc, imgcodecs, dnn, videoio)
 #   2. app-build    : compiles yolo26_detect against that OpenCV
 #   3. model-export : exports yolo26n.pt -> yolo26.onnx
 #   4. runtime-base : slim image with only the OpenCV libs
@@ -10,7 +10,8 @@
 #                     pass, so an incompatible model fails the BUILD, not your run
 #   6. runtime      : runtime-base + binary + model (the final image)
 
-ARG UBUNTU_VERSION=24.04
+ARG UBUNTU_VERSION=22.04
+ARG ROS_DISTRO=humble
 ARG OPENCV_VERSION=4.11.0
 
 # ---------------------------------------------------------------- 1. OpenCV
@@ -20,35 +21,39 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git ca-certificates pkg-config \
-        libjpeg-dev libpng-dev \
+        libjpeg-dev libpng-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git clone --depth 1 --branch ${OPENCV_VERSION} https://github.com/opencv/opencv.git /opencv \
     && cmake -S /opencv -B /opencv/build \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/opt/opencv \
-        -DBUILD_LIST=core,imgproc,imgcodecs,dnn \
+        -DBUILD_LIST=core,imgproc,imgcodecs,dnn,videoio \
+        -DWITH_FFMPEG=ON -DWITH_GSTREAMER=OFF \
         -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF \
         -DBUILD_opencv_apps=OFF -DBUILD_DOCS=OFF \
     && cmake --build /opencv/build -j"$(nproc)" \
     && cmake --install /opencv/build
 
 # ------------------------------------------------------------ 2. Application
-FROM ubuntu:${UBUNTU_VERSION} AS app-build
+FROM ros:${ROS_DISTRO}-ros-base AS app-build
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake libjpeg-dev libpng-dev \
+        build-essential cmake python3-colcon-common-extensions libjpeg-dev libpng-dev \
+        libavcodec58 libavformat58 libavutil56 libswscale5 libswresample3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=opencv-build /opt/opencv /opt/opencv
 
-WORKDIR /src
-COPY CMakeLists.txt main.cpp ./
-RUN cmake -S . -B build \
+WORKDIR /ws
+COPY CMakeLists.txt package.xml /ws/src/yolo26_ros/
+COPY include /ws/src/yolo26_ros/include
+COPY src /ws/src/yolo26_ros/src
+COPY launch /ws/src/yolo26_ros/launch
+RUN . /opt/ros/humble/setup.sh && colcon build --cmake-args \
         -DCMAKE_BUILD_TYPE=Release \
-        -DOpenCV_DIR=/opt/opencv/lib/cmake/opencv4 \
-    && cmake --build build -j"$(nproc)"
+        -DOpenCV_DIR=/opt/opencv/lib/cmake/opencv4
 
 # ---------------------------------------------------------- 3. Model export
 FROM python:3.11-slim AS model-export
@@ -56,7 +61,7 @@ FROM python:3.11-slim AS model-export
 # Export settings. The defaults give YOLO26's end-to-end (NMS-free) model,
 # output [1, 300, 6]. If OpenCV can't run that graph (the smoke test below
 # will fail), rebuild with:  --build-arg END2END=False
-# which exports the classic [1, 84, 8400] layout; main.cpp handles both.
+# which exports the classic [1, 84, 8400] layout; the detection library handles both.
 ARG END2END=True
 ARG OPSET=12
 
@@ -76,49 +81,52 @@ RUN yolo export model=yolo26n.pt format=onnx opset=${OPSET} simplify=True end2en
     && mv yolo26n.onnx yolo26.onnx
 
 # ------------------------------------------------------------ 4. Runtime base
-FROM ubuntu:${UBUNTU_VERSION} AS runtime-base
+FROM ros:${ROS_DISTRO}-ros-base AS runtime-base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libjpeg-turbo8 libpng16-16t64 libgomp1 \
+        libjpeg-turbo8 libpng16-16 libgomp1 \
+        libavcodec58 libavformat58 libavutil56 libswscale5 libswresample3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=opencv-build /opt/opencv/lib /opt/opencv/lib
 ENV LD_LIBRARY_PATH=/opt/opencv/lib
+ENV ROS_LOG_DIR=/tmp/roslog
+ENV PATH=/ws/install/yolo26_ros/lib/yolo26_ros:${PATH}
 
 # ------------------------------------------------------------- 5. Smoke test
 FROM runtime-base AS smoke-test
 
-COPY --from=app-build /src/build/yolo26_detect /usr/local/bin/yolo26_detect
+COPY --from=app-build /ws/install /ws/install
 COPY --from=model-export /export/yolo26.onnx /smoke/yolo26.onnx
 
 # A blank 640x480 PPM (OpenCV reads PPM natively). Zero detections is fine;
 # what matters is that the model loads and a forward pass completes.
 WORKDIR /smoke
 RUN { printf 'P6\n640 480\n255\n'; head -c 921600 /dev/zero; } > blank.ppm \
+    && . /opt/ros/humble/setup.sh && . /ws/install/setup.sh \
     && yolo26_detect blank.ppm \
+    && for exe in yolo26_detect detector_node video_feeder_node; do \
+         ldd "/ws/install/yolo26_ros/lib/yolo26_ros/$exe" > /tmp/linked; \
+         cat /tmp/linked; \
+         ! grep -q 'not found' /tmp/linked || exit 1; \
+         ! grep 'libopencv' /tmp/linked | grep -v '/opt/opencv/lib/' || exit 1; \
+       done \
     && touch /smoke/ok
 
 # --------------------------------------------------------------- 6. Runtime
 FROM runtime-base AS runtime
 
-COPY --from=app-build /src/build/yolo26_detect /usr/local/bin/yolo26_detect
+COPY --from=app-build /ws/install /ws/install
 COPY --from=model-export /export/yolo26.onnx /opt/model/yolo26.onnx
 # Forces the smoke test to run on every build (BuildKit skips unused stages).
 COPY --from=smoke-test /smoke/ok /opt/model/.smoke-test-passed
 
-# The program loads "yolo26.onnx" from the current working directory, and
-# writes annotated.jpg / detections.csv there. This wrapper links the bundled
-# model into whatever directory you mount, unless you supply your own.
-RUN printf '%s\n' \
-      '#!/bin/sh' \
-      '[ -e yolo26.onnx ] || ln -s /opt/model/yolo26.onnx yolo26.onnx' \
-      'exec /usr/local/bin/yolo26_detect "$@"' \
-      > /usr/local/bin/entrypoint.sh \
-    && chmod +x /usr/local/bin/entrypoint.sh
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 WORKDIR /data
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["input.jpg"]
+CMD ["ros2", "pkg", "executables", "yolo26_ros"]
 
 # Build:  docker build -t yolo26-detect .
 # Run:    docker run --rm -v "$PWD":/data yolo26-detect input.jpg 0.25 0.45

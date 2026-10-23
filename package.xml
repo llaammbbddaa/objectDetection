@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>yolo26_ros</name>
+  <version>0.1.0</version>
+  <description>Folder-based YOLO26 detection and a simulated drone video feed.</description>
+  <maintainer email="maintainer@example.com">YOLO26 maintainers</maintainer>
+  <license>TODO: choose a license</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

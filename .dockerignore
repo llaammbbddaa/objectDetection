@@ -1,0 +1,14 @@
+.git
+.aws
+.codex
+.agents
+build
+install
+log
+camera_feed_images
+annotated_output
+csv_output
+tests
+*.onnx
+*.pt
+__pycache__

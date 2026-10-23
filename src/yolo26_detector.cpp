@@ -1,23 +1,6 @@
-// YOLO26n ONNX inference with OpenCV 4.11 (DNN module)
-//
-// Model export used (end-to-end, NMS-free; this is YOLO26's default):
-//   yolo export model=yolo26n.pt format=onnx opset=12 simplify=True
-// The classic YOLO-style export is also supported (adds NMS on our side):
-//   yolo export model=yolo26n.pt format=onnx opset=12 simplify=True end2end=False
-//
-// Usage:
-//   ./yolo26_detect <input_image> [conf_thresh=0.25] [nms_thresh=0.45]
-//                   [--resolution WIDTHxHEIGHT]
-//   ./yolo26_detect <input_directory> <csv_directory> <annotated_directory>
-//                   [conf_thresh=0.25] [nms_thresh=0.45] [--resolution WIDTHxHEIGHT]
-//
-// Outputs:
-//   annotated.jpg   - original image with boxes + labels drawn
-//   detections.csv  - one row per detection: x1,y1,x2,y2,confidence,class_id,class_name
-//   For directory input, one CSV and one annotated image are written per image.
-//   (the same tensor is also printed to the console)
-
-#include <opencv2/opencv.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/dnn.hpp>
 
 #include <algorithm>
@@ -33,6 +16,8 @@
 #include <sys/stat.h>
 #include <vector>
 
+#include "yolo26_ros/yolo26_detector.hpp"
+namespace yolo26 {
 static const int INPUT_SIZE = 640;
 
 static const std::vector<std::string> CLASS_NAMES = {
@@ -68,67 +53,7 @@ static cv::Mat letterbox(const cv::Mat &src, int size, float &scale, int &padX, 
     return out;
 }
 
-struct Detection
-{
-    float x1, y1, x2, y2;
-    float confidence;
-    int classId;
-};
-
-static bool isDirectory(const std::string &path)
-{
-    struct stat info;
-    return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
-}
-
-static bool makeDirectory(const std::string &path)
-{
-    if (path.empty() || isDirectory(path))
-        return true;
-
-    const std::size_t separator = path.find_last_of('/');
-    if (separator != std::string::npos && separator > 0 &&
-        !makeDirectory(path.substr(0, separator)))
-        return false;
-
-    if (mkdir(path.c_str(), 0755) == 0)
-        return true;
-    return errno == EEXIST && isDirectory(path);
-}
-
-static std::string joinPath(const std::string &directory, const std::string &name)
-{
-    if (directory.empty() || directory == ".")
-        return name;
-    return directory.back() == '/' ? directory + name : directory + "/" + name;
-}
-
-static std::string fileStem(const std::string &path)
-{
-    const std::size_t slash = path.find_last_of('/');
-    const std::size_t dot = path.find_last_of('.');
-    const std::size_t nameStart = slash == std::string::npos ? 0 : slash + 1;
-    if (dot == std::string::npos || dot < nameStart)
-        return path.substr(nameStart);
-    return path.substr(nameStart, dot - nameStart);
-}
-
-static std::string fileExtension(const std::string &path)
-{
-    const std::size_t slash = path.find_last_of('/');
-    const std::size_t dot = path.find_last_of('.');
-    if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
-        return ".jpg";
-    return path.substr(dot);
-}
-
-struct Resolution
-{
-    int width;
-    int height;
-};
-
-static Resolution parseResolution(const std::string &value)
+Resolution parseResolution(const std::string &value)
 {
     const std::size_t separator = value.find('x');
     if (separator == std::string::npos || separator == 0 || separator == value.size() - 1)
@@ -287,20 +212,25 @@ static std::vector<Detection> detectTile(const cv::Mat &image, cv::dnn::Net &net
     return detections;
 }
 
-static bool processImage(const std::string &imagePath, const std::string &csvPath,
-                         const std::string &annotatedPath, cv::dnn::Net &net,
-                         float confThresh, float nmsThresh, int tileColumns, int tileRows)
-{
-    cv::Mat image = cv::imread(imagePath, cv::IMREAD_COLOR);
-    if (image.empty())
-    {
-        std::cerr << "Could not read image: " << imagePath << "\n";
-        return false;
-    }
 
-    const auto detectionStart = std::chrono::steady_clock::now();
+TileLayout layoutFromResolution(int w,int h) {
+ if(w<=0 || h<=0) throw std::invalid_argument("resolution must be positive");
+ return {1+(w-1)/640,1+(h-1)/640};
+}
+TileLayout autoLayout(const cv::Size& s) { return layoutFromResolution(s.width,s.height); }
+Detector::Detector(const std::string& path) : net_(cv::dnn::readNetFromONNX(path)) {
+ net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+ net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+ detectTile(cv::Mat(640,640,CV_8UC3,cv::Scalar(0,0,0)),net_,0.25f,0.45f);
+}
+std::vector<Detection> Detector::detect(const cv::Mat& image,float c,float n,TileLayout l) { return run(image,c,n,l,false); }
+std::vector<Detection> Detector::detectLegacy(const cv::Mat& image,float c,float n,TileLayout l) { return run(image,c,n,l,true); }
+std::vector<Detection> Detector::run(const cv::Mat& image,float confThresh,float nmsThresh,TileLayout l,bool legacy) {
+ if(image.empty()) throw std::invalid_argument("empty image");
+ auto& net=net_;
+ int tileColumns=l.columns, tileRows=l.rows;
     std::vector<Detection> detections;
-    if (tileColumns > 0 && tileRows > 0)
+    if (tileColumns > 0 && tileRows > 0 && (legacy || tileColumns > 1 || tileRows > 1))
     {
         const std::vector<cv::Rect> tiles =
             makeTiles(image.size(), tileColumns, tileRows);
@@ -340,25 +270,9 @@ static bool processImage(const std::string &imagePath, const std::string &csvPat
         detections = detectTile(image, net, confThresh, nmsThresh);
     }
 
-    const double detectionTimeMs =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - detectionStart)
-            .count();
-
-    // ------------------------------------------------- output tensor (N x 6)
-    // Columns: x1, y1, x2, y2, confidence, class_id
-    cv::Mat tensor(static_cast<int>(detections.size()), 6, CV_32F);
-    for (int i = 0; i < tensor.rows; ++i)
-    {
-        const Detection &d = detections[i];
-        float *r = tensor.ptr<float>(i);
-        r[0] = d.x1;
-        r[1] = d.y1;
-        r[2] = d.x2;
-        r[3] = d.y2;
-        r[4] = d.confidence;
-        r[5] = static_cast<float>(d.classId);
-    }
-
+    return detections;
+}
+bool writeCsv(const std::string& csvPath,const std::vector<Detection>& detections,const cv::Size& imageSize,double detectionTimeMs) {
     std::ofstream csv(csvPath);
     if (!csv)
     {
@@ -367,7 +281,7 @@ static bool processImage(const std::string &imagePath, const std::string &csvPat
     }
     csv << "x1,y1,x2,y2,confidence,class_id,class_name,resolutionX,resolutionY,detection_time\n";
 
-    std::cout << imagePath << ": " << detections.size() << " detections\n";
+
 
     for (const Detection &d : detections)
     {
@@ -379,11 +293,14 @@ static bool processImage(const std::string &imagePath, const std::string &csvPat
             << d.x1 << "," << d.y1 << "," << d.x2 << "," << d.y2 << ","
             << std::setprecision(4) << d.confidence << ","
             << d.classId << "," << name << ","
-            << image.cols << "," << image.rows << ","
+            << imageSize.width << "," << imageSize.height << ","
             << std::setprecision(3) << detectionTimeMs << "\n";
     }
 
-    // ------------------------------------------------------------ annotate
+    csv.close();
+    return bool(csv);
+}
+cv::Mat annotate(const cv::Mat& image,const std::vector<Detection>& detections) {
     cv::Mat annotated = image.clone();
     for (const Detection &d : detections)
     {
@@ -412,167 +329,6 @@ static bool processImage(const std::string &imagePath, const std::string &csvPat
                     cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
     }
 
-    if (!cv::imwrite(annotatedPath, annotated))
-    {
-        std::cerr << "Could not write annotated image: " << annotatedPath << "\n";
-        return false;
-    }
-    std::cout << "  CSV: " << csvPath << "\n"
-              << "  Image: " << annotatedPath << "\n";
-    return true;
+    return annotated;
 }
-
-int main(int argc, char **argv)
-{
-    if (argc < 2)
-    {
-        std::cerr << "Usage: " << argv[0]
-                  << " <input_image> [conf_thresh=0.25] [nms_thresh=0.45]"
-                  << " [--resolution WIDTHxHEIGHT]\n"
-                  << "       " << argv[0]
-                  << " <input_directory> <csv_directory> <annotated_directory>"
-                  << " [conf_thresh=0.25] [nms_thresh=0.45] [--resolution WIDTHxHEIGHT]\n";
-        return 1;
-    }
-
-    try
-    {
-        std::vector<std::string> positional;
-        Resolution resolution{0, 0};
-        bool hasResolution = false;
-        for (int i = 1; i < argc; ++i)
-        {
-            const std::string argument = argv[i];
-            if (argument == "--resolution")
-            {
-                if (hasResolution || i + 1 >= argc)
-                    throw std::invalid_argument("--resolution requires WIDTHxHEIGHT");
-                resolution = parseResolution(argv[++i]);
-                hasResolution = true;
-            }
-            else if (argument.rfind("--resolution=", 0) == 0)
-            {
-                if (hasResolution)
-                    throw std::invalid_argument("resolution specified more than once");
-                resolution = parseResolution(argument.substr(13));
-                hasResolution = true;
-            }
-            else
-            {
-                positional.push_back(argument);
-            }
-        }
-
-        if (positional.empty())
-            throw std::invalid_argument("an input image or directory is required");
-
-        const std::string inputPath = positional[0];
-        const bool directoryMode = isDirectory(inputPath);
-        positional.erase(positional.begin());
-        const std::string csvDirectory =
-            directoryMode ? (positional.size() > 0 ? positional[0] : "csv_output") : ".";
-        const std::string annotatedDirectory =
-            directoryMode ? (positional.size() > 1 ? positional[1] : "annotated_output") : ".";
-        const std::size_t thresholdOffset = directoryMode ? 2 : 0;
-        const float confThresh = positional.size() > thresholdOffset
-                                     ? std::stof(positional[thresholdOffset])
-                                     : 0.25f;
-        const float nmsThresh = positional.size() > thresholdOffset + 1
-                                    ? std::stof(positional[thresholdOffset + 1])
-                                    : 0.45f;
-
-        if (positional.size() > thresholdOffset + 2)
-            throw std::invalid_argument("too many positional arguments");
-
-        if (confThresh < 0.0f || confThresh > 1.0f || nmsThresh < 0.0f ||
-            nmsThresh > 1.0f)
-        {
-            throw std::invalid_argument("thresholds must be between 0 and 1");
-        }
-
-        cv::dnn::Net net = cv::dnn::readNetFromONNX("yolo26.onnx");
-        net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-        net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
-
-        if (!directoryMode)
-        {
-            const int tileColumns =
-                hasResolution ? static_cast<int>(std::ceil(
-                                    static_cast<double>(resolution.width) / INPUT_SIZE))
-                              : 0;
-            const int tileRows =
-                hasResolution ? static_cast<int>(std::ceil(
-                                    static_cast<double>(resolution.height) / INPUT_SIZE))
-                              : 0;
-            return processImage(inputPath, "detections.csv", "annotated.jpg", net,
-                                confThresh, nmsThresh, tileColumns, tileRows)
-                       ? 0
-                       : 1;
-        }
-
-        if (!makeDirectory(csvDirectory) || !makeDirectory(annotatedDirectory))
-        {
-            std::cerr << "Could not create output directories.\n";
-            return 1;
-        }
-
-        std::vector<cv::String> paths;
-        cv::glob(joinPath(inputPath, "*"), paths, false);
-        std::sort(paths.begin(), paths.end());
-
-        const int tileColumns =
-            hasResolution
-                ? static_cast<int>(
-                      std::ceil(static_cast<double>(resolution.width) / INPUT_SIZE))
-                : 2;
-        const int tileRows =
-            hasResolution
-                ? static_cast<int>(
-                      std::ceil(static_cast<double>(resolution.height) / INPUT_SIZE))
-                : 2;
-
-        int processed = 0;
-        int failed = 0;
-        for (const cv::String &path : paths)
-        {
-            if (isDirectory(path))
-                continue;
-
-            const std::string stem = fileStem(path);
-            const std::string csvPath = joinPath(csvDirectory, stem + ".csv");
-            const std::string annotatedPath =
-                joinPath(annotatedDirectory, stem + "_annotated" + fileExtension(path));
-            if (processImage(path, csvPath, annotatedPath, net, confThresh, nmsThresh,
-                             tileColumns, tileRows))
-                ++processed;
-            else
-                ++failed;
-        }
-
-        if (processed == 0)
-        {
-            std::cerr << "No readable images found in: " << inputPath << "\n";
-            return 1;
-        }
-        std::cout << "Processed " << processed << " image(s)";
-        if (failed != 0)
-            std::cout << "; " << failed << " failed";
-        std::cout << ".\n";
-        return failed == 0 ? 0 : 1;
-    }
-    catch (const std::invalid_argument &e)
-    {
-        std::cerr << "Invalid argument: " << e.what() << "\n";
-        return 1;
-    }
-    catch (const std::runtime_error &e)
-    {
-        std::cerr << "Inference failed: " << e.what() << "\n";
-        return 1;
-    }
-    catch (const cv::Exception &e)
-    {
-        std::cerr << "Failed to load or run yolo26.onnx: " << e.what() << "\n";
-        return 1;
-    }
 }

@@ -40,3 +40,11 @@ Thumbs.db
 testFlight1/
 annotated_output/
 csv_output/
+
+camera_feed_images/
+install/
+log/
+__pycache__/
+
+*.mp4
+yolo26_detect
